@@ -15,7 +15,7 @@ def desktop(session):
     from tkinter.scrolledtext import ScrolledText
 
     root = tk.Tk()
-    root.title("BBchannel · 对话配队 v0.2")
+    root.title("BBchannel · 对话配队 v0.4")
     root.geometry("990x620")
     root.minsize(760, 460)
     root.columnconfigure(0, weight=1)
@@ -31,6 +31,10 @@ def desktop(session):
         template.current(0)
     load_btn = ttk.Button(bar, text="加载", command=lambda: send("加载预设：" + template.get()))
     load_btn.pack(side="left")
+    roster_btn = ttk.Button(bar, text="我的从者", command=lambda: send("我的从者"))
+    roster_btn.pack(side="left", padx=(8, 2))
+    find_btn = ttk.Button(bar, text="匹配预设", command=lambda: send("匹配预设"))
+    find_btn.pack(side="left")
     model_bar = ttk.Frame(header)
     model_bar.pack(fill="x", pady=(8, 0))
     cloud = isinstance(session.planner, BigModelPlanner)
@@ -116,7 +120,7 @@ def desktop(session):
         template.configure(values=list(session.library.presets()))
         summary = answer.split("\n", 1)[0] if answer.startswith(("已更新草案", "已撤销上一条")) else answer
         display(chat, "助手　" + summary + "\n\n")
-        display(draft, preview(session.cfg, session.changed_waves), clear=True)
+        display(draft, session.preview(), clear=True)
         entry.focus_set()
 
     def send(text=None):
@@ -156,7 +160,7 @@ def desktop(session):
     undo_btn.pack(side="right", padx=6)
     send_btn = ttk.Button(footer, text="发送", command=send)
     send_btn.grid(row=0, column=1, padx=(8, 0))
-    controls = (load_btn, export_btn, undo_btn, send_btn, key_entry, local_entry, *radios)
+    controls = (load_btn, roster_btn, find_btn, export_btn, undo_btn, send_btn, key_entry, local_entry, *radios)
     entry.bind("<Return>", lambda event: send())
     display(chat, HELP + "\n\n")
     display(draft, preview(session.cfg), clear=True)

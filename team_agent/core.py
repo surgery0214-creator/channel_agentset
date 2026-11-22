@@ -144,10 +144,7 @@ class Library:
             raise Choose("匹配到多个预设，请选一个。", matches)
         raise UnknownReference(f"没有匹配到预设「{query}」。输入「预设」可查看名称。")
 
-    def load(self, name):
-        path = self.presets().get(name)
-        if path is None:
-            raise PlanError("该预设已被移动或改名，请重新选择。")
+    def read_preset(self, path):
         config = read_json(path)
         if not isinstance(config, dict) or config.get("server") != "CH" or not any(roster(config)):
             raise PlanError("仅支持国服的平铺队伍预设。")
@@ -162,6 +159,13 @@ class Library:
                 for field in ("skill", "np"):
                     if not isinstance(config.get(f"round{wave}_turn{turn}_{field}"), list):
                         raise PlanError(f"预设中的第{wave}面第{turn+1}回合缺少有效 {field} 列表。")
+        return config
+
+    def load(self, name):
+        path = self.presets().get(name)
+        if path is None:
+            raise PlanError("该预设已被移动或改名，请重新选择。")
+        config = self.read_preset(path)
         # Use this installation's device, AP and stopping preferences.
         local = self.current()
         for key in LOCAL_FIELDS:
@@ -270,7 +274,9 @@ def editable_wave(cfg, wave):
     return prefix
 
 
-def preview(cfg, changed_waves=()):
+def preview(cfg, changed_waves=(), changed_turns=None):
+    from .battle_edit import describe
+
     if not cfg:
         return "尚未选择队伍。"
     members = roster(cfg)
@@ -279,20 +285,12 @@ def preview(cfg, changed_waves=()):
     for wave in range(1, 4):
         for turn in range(cfg.get(f"round{wave}_turns", 0)):
             prefix = f"round{wave}_turn{turn}_"
-            actions = []
-            for action in cfg.get(prefix+"skill", []):
-                seq = action if isinstance(action, list) else [action]
-                code = seq[0] if seq else None
-                if type(code) is int and 1 <= code <= 12 and len(seq) <= 2:
-                    caster = f"{(code-1)//3+1}号位" if code <= 9 else "御主"
-                    target = f"给{seq[1]}号位" if len(seq)==2 else ""
-                    actions.append(f"{caster}{(code-1)%3+1}技能{target}")
-                else:
-                    actions.append(f"原动作{action}")
+            actions = [describe(action) for action in cfg.get(prefix+"skill", [])]
             actions.extend(f"{n}号位宝具" for n in cfg.get(prefix+"np", []))
             if cfg.get(prefix+"strategy") or cfg.get(prefix+"condition"):
                 actions.append("原出卡策略／条件")
-            marker = "〔本次修改〕" if wave in changed_waves else ""
+            changed = wave in changed_waves if changed_turns is None else (wave, turn+1) in changed_turns
+            marker = "〔本次修改〕" if changed else ""
             lines.append(f"第{wave}面 · 回合{turn+1}{marker}　" + (" → ".join(actions) or "常规出卡"))
     return "\n".join(lines)
 

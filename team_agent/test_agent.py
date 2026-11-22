@@ -13,7 +13,7 @@ from .dialogue import Session
 from .model import BIGMODEL_MODEL, BIGMODEL_URL, BigModelPlanner, OllamaPlanner
 
 
-class AgentTest(unittest.TestCase):
+class AgentFixture(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.example = "爱尔奎特_光狐_光狐"
@@ -44,7 +44,120 @@ class AgentTest(unittest.TestCase):
         cls.lib = Library(root)
 
     def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        shutil.copytree(type(self).lib.root, root, dirs_exist_ok=True)
+        self.lib = Library(root)
         self.session = Session(self.lib)
+
+
+class AgentTest(AgentFixture):
+    def test_inline_match_select_export_and_undo(self):
+        self.session.send("加载预设：摩根_光狐_光狐")
+        previous = copy.deepcopy(self.session.cfg)
+        reply = self.session.send("我有公主和一只光狐，能用哪套？")
+        self.assertIn(f"1. {self.example}　借3号位 测试辅助", reply)
+        self.assertNotIn("摩根_", reply)
+        self.assertEqual(self.session.cfg, previous)
+        self.assertFalse(self.session.finder.store.path.exists())
+        self.assertIn("已更新", self.session.send("用第一套"))
+        expected = self.lib.load(self.example)
+        self.assertEqual(self.session.cfg, expected)
+        self.session.send("导出 匹配到的队伍")
+        self.assertEqual(read_json(self.lib.presets()["匹配到的队伍"]), expected)
+        self.session.send("撤销")
+        self.assertEqual(self.session.cfg, previous)
+
+    def test_owned_list_survives_restart_and_registration_is_idempotent(self):
+        for _ in range(2):
+            self.assertIn("已保存", self.session.send("登记从者：公主、两只光狐"))
+        other = Session(Library(self.lib.root))
+        self.assertIn("测试辅助×2", other.send("我的从者"))
+        self.assertIn(self.example, other.send("匹配预设"))
+        self.assertIn("已保存", other.send("移除从者：公主"))
+        self.assertNotIn("测试主攻", self.session.send("我的从者"))
+        self.assertIn("没有完全匹配", self.session.send("匹配预设"))
+
+    def test_support_restriction_and_trial_dont_overwrite_saved_roster(self):
+        s = self.session
+        s.send("我有摩根和光狐")
+        s.send("可借助战：摩根")
+        self.assertIn("可借名单缺 测试辅助", s.send("匹配预设"))
+        self.assertIn("已保存", s.send("可借助战：光狐"))
+        self.assertIn("1. 摩根_", s.send("匹配预设"))
+        self.assertIn("1. " + self.example, s.send("我有公主和一只光狐，能用哪套？"))
+        self.assertNotIn("测试主攻", s.send("我的从者"))
+        trial = s.send("我有公主和光狐，只能借摩根，能用哪套？")
+        self.assertIn("没有完全匹配", trial)
+        self.assertIn("可借名单缺 测试辅助", trial)
+        self.assertEqual(s.finder.store.access().supports, ["测试辅助"])
+        s.send("没有可借助战")
+        self.assertIn("没有完全匹配", s.send("匹配预设"))
+        s.send("可借助战不限")
+        self.assertIn("1. 摩根_", s.send("匹配预设"))
+
+    def test_count_backline_and_assist_filters(self):
+        cfg = read_json(self.lib.presets()[self.example])
+        cfg.update(servant_3_name="测试队长", servant_4_name="测试术士", assistIdx=3,
+                   assistMode="从者礼装", assistEquip="测试礼装", onlyFriendAssist=1)
+        path = self.lib.root / "settings/后排测试.json"
+        path.write_text(json.dumps(cfg), encoding="utf-8")
+        self.session.send("可借助战：摩根")
+        self.session.send("登记从者：公主、光狐")
+        reply = self.session.send("匹配预设")
+        self.assertIn("后排测试", reply)
+        self.assertIn("自有缺 测试辅助×1、测试术士×1", reply)
+        self.session.send("登记从者：光狐×2、狐狸")
+        self.assertIn("借4号位 测试队长（礼装 测试礼装），限好友", self.session.send("匹配预设"))
+        self.session.send("用第一套")
+        self.assertEqual(self.session.cfg, self.lib.load("后排测试"))
+
+    def test_registration_and_disambiguation_are_atomic(self):
+        self.lib.aliases["同名"] = {"测试术士", "测试队长"}
+        s = self.session
+        s.send("登记从者：公主")
+        self.assertIn("未完成", s.send("登记从者：光狐、未知角色"))
+        self.assertEqual(s.finder.store.access().owned, {"测试主攻": 1})
+        self.assertIn("多个角色", s.send("登记从者：光狐、同名"))
+        self.assertEqual(s.finder.store.access().owned, {"测试主攻": 1})
+        s.send("测试术士")
+        self.assertEqual(s.finder.store.access().owned, {"测试主攻": 1, "测试辅助": 1, "测试术士": 1})
+        self.assertIn("正整数", s.send("登记从者：光狐×0"))
+
+    def test_stale_selection_is_rechecked_before_loading(self):
+        self.session.send("登记从者：光狐、公主")
+        self.session.send("匹配预设")
+        other = Session(self.lib)
+        other.send("移除从者：光狐")
+        self.assertIn("重新匹配", self.session.send("选第一套"))
+        self.assertIsNone(self.session.cfg)
+        self.assertIn("匹配预设", self.session.send("用第九套"))
+
+    def test_bad_presets_are_skipped_without_hiding_compatible_ones(self):
+        settings = self.lib.root / "settings"
+        (settings / "损坏.json").write_text("{", encoding="utf-8")
+        bad = read_json(self.lib.presets()[self.example])
+        bad["assistIdx"] = False
+        (settings / "无助战位.json").write_text(json.dumps(bad), encoding="utf-8")
+        reply = self.session.send("我有公主和一只光狐，能用哪套？")
+        self.assertIn(self.example, reply)
+        self.assertIn("跳过 2", reply)
+
+    def test_model_recommendation_uses_local_matcher(self):
+        s = self.session
+        s.planner = BigModelPlanner("test-only")
+        plan = {"ops": [{"op": "recommend", "owned": ["公主", {"name": "光狐", "count": 1}]}]}
+        envelope = {"choices": [{"message": {"content": json.dumps(plan)}}]}
+        with patch("team_agent.model.request.urlopen", return_value=io.BytesIO(json.dumps(envelope).encode())) as post:
+            self.assertIn("1. " + self.example, s.send("帮我从已有作业里挑挑，我这边能出公主跟杀狐"))
+            self.assertIsNone(s.cfg)
+            s.send("用第一套")
+            post.assert_called_once()
+        self.assertEqual(s.cfg, self.lib.load(self.example))
+        s.planner = lambda text, session: [{"op": "register", "members": ["摩根"]}]
+        self.assertIn("保存名单请使用", s.send("给我看看还缺哪些人"))
+        self.assertFalse(s.finder.store.path.exists())
 
     def test_single_message_edits_only_second_wave(self):
         source = self.lib.load(self.example)

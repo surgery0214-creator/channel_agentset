@@ -3,14 +3,22 @@
 import copy
 import re
 
+from .collection import PresetFinder, collection_request
+from .battle_edit import TurnEditor, actions_for, describe
+from .edit_language import precise_plan
 from .core import Choose, NUMBERS, PlanError, choose_slot, editable_wave, export_preset, norm, preview, roster
 
 
 HELP = """可以直接这样说
+• 我有公主和一只光狐，能用哪套？
+• 登记从者：公主、光狐　／　可借助战：光狐
+• 匹配预设　／　用第一套
 • 用公主双光狐队。第二面只让三号位光狐开一技能给公主，然后公主开宝具。
 • 第二面追加二号位光狐三技能给公主
 • 把刚才的充能挪到第三面
 • 第三面只改宝具：一号位放宝具
+• 第二面把二号位光狐一技能移到最前
+• 第一面第二回合删除第2项动作
 • 新建队伍：摩根、光狐、光狐，助战三号位
 • 第一面：摩根一技能，二号位光狐一技能给摩根，摩根开宝具
 输入「预设」「预览」「撤销」「取消」或「导出 新预设名」。"""
@@ -95,12 +103,18 @@ def check_shape(obj, required, optional=()):
         raise PlanError("动作格式不完整，请重新描述。")
 
 
-def changed_waves(before, after):
+def edited_turns(before, after):
     if not before or not after or roster(before) != roster(after):
-        return ()
-    return tuple(wave for wave in range(1, 4) if any(
-        before.get(f"round{wave}_turn0_{field}") != after.get(f"round{wave}_turn0_{field}")
-        for field in ("skill", "np")))
+        return []
+    return [(w, t+1) for w in range(1, 4) for t in range(after.get(f"round{w}_turns", 0))
+            if any(before.get(f"round{w}_turn{t}_{f}") != after.get(f"round{w}_turn{t}_{f}") for f in ("skill", "np"))]
+
+
+def match_answer(issue, text):
+    value = norm(text).strip("。！ ").translate(NUMBERS)
+    value = norm(issue.aliases.get(value, value))
+    return next((c for c in issue.choices if norm(text) == norm(c)
+                 or value in (norm(c), norm(c).removesuffix("号位"))), None)
 
 
 def move_recent_skill(lib, cfg, recent, op, pick):
@@ -151,6 +165,7 @@ def move_recent_skill(lib, cfg, recent, op, pick):
 class Session:
     def __init__(self, library, planner=None):
         self.library = library
+        self.finder = PresetFinder(library)
         self.planner = planner
         self.cfg = None
         self.title = ""
@@ -159,13 +174,30 @@ class Session:
         self.history = []
         self.recent_skills = []
         self.changed_waves = ()
+        self.changed_turns = []
+        self.edit_run = None
 
     def execute(self, ops, answers=(), *, player_text=None):
         if not isinstance(ops, list) or not 1 <= len(ops) <= 12:
             raise PlanError("每条消息需要包含 1 至 12 项配队操作。")
+        if any(isinstance(op, dict) and op.get("op") == "edit_turn" for op in ops):
+            from .edit_graph import EditRun
+            if any(not isinstance(op, dict) or op.get("op") not in
+                   ("load", "new", "use_match", "edit_turn") for op in ops):
+                raise PlanError("请将精确编辑和整面替换分开发送。")
+            if any(op["op"] in ("load", "use_match", "new") for op in ops[1:]):
+                raise PlanError("请将选队操作放在本条编辑指令的开头。")
+            run = EditRun(self._apply)
+            result = run.start(ops, player_text)
+            self.edit_run = run if result is None else None
+            return self._finish_run(result)
+        return self._apply(ops, answers, player_text=player_text)
+
+    def _apply(self, ops, answers, *, player_text, advanced=False):
         cfg, title = copy.deepcopy(self.cfg), self.title
         baseline = self.cfg
         recent = list(self.recent_skills)
+        notes = []
         edited_skills = False
         replies = iter(answers)
 
@@ -196,14 +228,29 @@ class Session:
                 if not isinstance(op, dict):
                     raise PlanError("无法识别配队操作。")
                 kind = op.get("op")
-                if kind == "load":
+                if kind in ("collection", "register", "remove", "supports", "recommend"):
+                    if len(ops) != 1:
+                        raise PlanError("请先完成名单或匹配操作，再选择队伍。")
+                    if player_text is not None and kind in ("register", "remove", "supports"):
+                        raise PlanError("保存名单请使用「登记从者」「移除从者」或「可借助战」指令。")
+                    reply = self.finder.handle(op, resolve)
+                    self.pending = None
+                    return reply
+                if kind == "use_match":
+                    check_shape(op, ("op", "index"))
+                    title, cfg = self.finder.select(op["index"])
+                    baseline, recent = copy.deepcopy(cfg), []
+                elif kind == "load":
                     check_shape(op, ("op", "name"))
                     selected = resolve(self.library.preset_name, op["name"])
                     if (player_text is not None and len(ops) > 1 and selected == title
                             and not re.search(r"重新加载|重载|重置|从原预设|恢复预设", player_text)):
                         continue
                     title = selected
-                    cfg = self.library.load(title)
+                    if player_text is not None and selected in self.finder.names:
+                        title, cfg = self.finder.select(self.finder.names.index(selected) + 1)
+                    else:
+                        cfg = self.library.load(title)
                     baseline, recent = copy.deepcopy(cfg), []
                 elif kind == "new":
                     check_shape(op, ("op", "members"), ("assist",))
@@ -219,6 +266,13 @@ class Session:
                     cfg = self.library.new_team(names, assist)
                     title = "新建队伍"
                     baseline, recent = copy.deepcopy(cfg), []
+                elif kind == "edit_turn":
+                    if not cfg:
+                        raise PlanError("请先加载预设或新建队伍。")
+                    wave, turn = op.get("wave"), op.get("turn", 1)
+                    editor = TurnEditor(self.library, cfg, wave, turn, pick, player_text)
+                    notes.append(f"第{wave}面第{turn}回合　" + editor.edit(op))
+                    recent = []
                 elif kind == "move_skill":
                     if not cfg:
                         raise PlanError("请先加载队伍并指定要移动的技能。")
@@ -268,14 +322,38 @@ class Session:
                 else:
                     raise PlanError("不支持该配队操作。")
         except Choose as issue:
+            if advanced:
+                raise
             self.pending = (ops, tuple(answers), issue, player_text)
             return f"{issue}　" + " / ".join(issue.choices)
+        result = dict(cfg=cfg, title=title, recent=recent, turns=edited_turns(baseline, cfg), notes=notes)
+        return result if advanced else self._commit(result)
+
+    def _finish_run(self, result):
+        if result is None:
+            issue = self.edit_run.issue
+            return f"{issue}　" + " / ".join(issue.choices)
+        self.edit_run = None
+        if self.cfg == result["cfg"] and self.title == result["title"]:
+            return "当前草案已符合这条指令。" + "。".join(result["notes"])
+        return self._commit(result)
+
+    def _commit(self, result):
         self.pending = None
         self.previous = (self.cfg, self.title, self.recent_skills)
-        self.changed_waves = changed_waves(baseline, cfg)
-        self.recent_skills = recent
-        self.cfg, self.title = cfg, title
-        return f"已更新草案「{title}」。\n" + preview(cfg, self.changed_waves)
+        self._mark_turns(result["turns"])
+        self.recent_skills = result["recent"]
+        self.cfg, self.title = result["cfg"], result["title"]
+        self.finder.names = []
+        summary = "；".join(result["notes"])
+        return f"已更新草案「{self.title}」。{summary}\n" + self.preview()
+
+    def _mark_turns(self, turns):
+        self.changed_turns = [tuple(turn) for turn in turns]
+        self.changed_waves = tuple(sorted({wave for wave, _ in self.changed_turns}))
+
+    def preview(self):
+        return preview(self.cfg, self.changed_waves, self.changed_turns)
 
     def send(self, message):
         text = message.strip()
@@ -290,37 +368,61 @@ class Session:
         if text in ("预设", "列出预设", "有哪些预设"):
             return "已有预设\n" + "\n".join(self.library.presets())
         if text in ("取消", "撤销"):
-            if self.pending or text == "取消":
+            if self.pending or self.edit_run or text == "取消":
                 self.pending = None
+                self.edit_run = None
+                self.finder.names = []
                 return "已结束追问，保留原草案。"
             if self.previous is None:
                 return "没有可撤销的修改。"
             old = self.cfg
             self.cfg, self.title, self.recent_skills = self.previous
-            self.changed_waves = changed_waves(old, self.cfg)
+            self._mark_turns(edited_turns(old, self.cfg))
             self.previous = None
+            self.finder.names = []
             self.history.clear()
-            return "已撤销上一条修改。\n" + preview(self.cfg, self.changed_waves)
+            return "已撤销上一条修改。\n" + self.preview()
         if text in ("预览", "查看队伍"):
-            return preview(self.cfg, self.changed_waves)
+            return self.preview()
+        detail = re.fullmatch(r"(?:查看|预览)第?([123])面第?(\d+)回合", text.translate(NUMBERS))
+        if detail and self.cfg:
+            w, t = int(detail[1]), int(detail[2])
+            items = actions_for(self.cfg, w, t)
+            lines = [f"第{w}面第{t}回合"]
+            party = None if any(roster(self.cfg)[3:]) else roster(self.cfg)
+            for i, item in enumerate(items):
+                lines.append(f"第{i+1}项 {describe(item, party)}")
+            return "\n".join(lines)
+        if self.edit_run:
+            issue = self.edit_run.issue
+            choice = match_answer(issue, text)
+            if choice is None:
+                return f"{issue}　" + " / ".join(issue.choices) + "。也可以输入「取消」。"
+            run, self.edit_run = self.edit_run, None
+            result = run.resume(choice)
+            self.edit_run = run if result is None else None
+            return self.remember(text, self._finish_run(result))
         if self.pending:
             ops, answers, issue, player_text = self.pending
-            value = norm(text).strip("。！ ").translate(NUMBERS)
-            value = norm(issue.aliases.get(value, value))
-            choices = [c for c in issue.choices if norm(text) == norm(c)
-                       or value in (norm(c), norm(c).removesuffix("号位"))]
-            if len(choices) != 1:
+            choice = match_answer(issue, text)
+            if choice is None:
                 return f"{issue}　" + " / ".join(issue.choices) + "。也可以输入「取消」。"
             self.pending = None
-            return self.remember(text, self.execute(ops, (*answers, choices[0]), player_text=player_text))
+            return self.remember(text, self.execute(ops, (*answers, choice), player_text=player_text))
         match = re.fullmatch(r"(?:导出|另存为)[：:\s]+(.+)", text)
         if match:
             if not self.cfg:
                 raise PlanError("请先创建队伍草案。")
             path = export_preset(self.cfg, self.library.root / "settings", match[1])
             return f"已另存预设：{path}"
+        query = collection_request(text, self.library)
+        if query is not None:
+            return self.execute([query])
+        precise = precise_plan(text)
         move = move_request(text)
-        if move:
+        if precise:
+            reply = self.execute(precise)
+        elif move:
             # The player identified one previous action. Preserve every unrelated action.
             reply = self.execute([move])
         elif text.startswith("加载预设："):
