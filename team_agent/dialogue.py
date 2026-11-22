@@ -3,12 +3,13 @@
 import copy
 import re
 
-from .core import Choose, NUMBERS, PlanError, UnknownReference, editable_wave, export_preset, norm, preview
+from .core import Choose, NUMBERS, PlanError, choose_slot, editable_wave, export_preset, norm, preview, roster
 
 
 HELP = """可以直接这样说
 • 用公主双光狐队。第二面只让三号位光狐开一技能给公主，然后公主开宝具。
 • 第二面追加二号位光狐三技能给公主
+• 把刚才的充能挪到第三面
 • 第三面只改宝具：一号位放宝具
 • 新建队伍：摩根、光狐、光狐，助战三号位
 • 第一面：摩根一技能，二号位光狐一技能给摩根，摩根开宝具
@@ -37,8 +38,18 @@ def parse_action(text):
     raise Unparsed(f"没读懂「{text}」。可写成「三号位光狐一技能给公主」或「公主放宝具」。")
 
 
+def move_request(message):
+    move = re.fullmatch(r"(?:请)?(?:把|将)?(?:刚才|刚刚|上次)(?:的|那个|那次)?([^，,。；;、\n]{1,16}?)(?:挪到|移到|移动到|挪去|移至)(?:第)?([一二三123])面(?:末尾|最后)?", message.strip().rstrip("。！"))
+    if move:
+        return {"op": "move_skill", "skill": move[1], "to_wave": int(move[2].translate(NUMBERS))}
+    return None
+
+
 def offline_plan(message):
     message = message.strip().rstrip("。！")
+    move = move_request(message)
+    if move:
+        return [move]
     message = re.sub(r"[，,。；;]?(?:其他|其它|其余)(?:照旧|不变|保持不变)$", "", message)
     chunks = re.split(r"(?=第[一二三123]面|(?<!第)[一二三123]面)", message)
     header = chunks.pop(0).strip(" ，,。；;：:")
@@ -84,6 +95,59 @@ def check_shape(obj, required, optional=()):
         raise PlanError("动作格式不完整，请重新描述。")
 
 
+def changed_waves(before, after):
+    if not before or not after or roster(before) != roster(after):
+        return ()
+    return tuple(wave for wave in range(1, 4) if any(
+        before.get(f"round{wave}_turn0_{field}") != after.get(f"round{wave}_turn0_{field}")
+        for field in ("skill", "np")))
+
+
+def move_recent_skill(lib, cfg, recent, op, pick):
+    check_shape(op, ("op", "to_wave"), ("skill",))
+    dest = op["to_wave"]
+    dest_key = editable_wave(cfg, dest) + "skill"
+    selector = op.get("skill", "技能")
+    if not isinstance(selector, str):
+        raise PlanError("请用技能名称或序号指出要移动的动作。")
+    options = {}
+    actors = {}
+    for wave, index in recent:
+        key = f"round{wave}_turn0_skill"
+        action = cfg[key][index]
+        code = action[0] if isinstance(action, list) else action
+        actor, number = divmod(code - 1, 3)
+        skill_name = lib.data[roster(cfg)[actor]]["skill_name"][number]
+        if selector not in ("技能", "动作", skill_name) and selector.translate(NUMBERS) != f"{number+1}技能":
+            continue
+        target = f"给{action[1]}号位" if isinstance(action, list) else ""
+        label = f"第{wave}面第{index+1}个：{actor+1}号位{number+1}技能{target}"
+        options[label] = wave, index
+        actors[label] = actor + 1
+    if not options:
+        raise PlanError(f"上次技能修改中没有可移动的「{selector}」。请先指定对应的技能。")
+    choice = next(iter(options))
+    if len(options) > 1:
+        issue = Choose("上次涉及多个符合条件的技能。要移动哪一个？", list(options))
+        for i, label in enumerate(options, 1):
+            issue.aliases[str(i)] = label
+            issue.aliases[f"第{i}个"] = label
+        slots = sorted(set(actors.values()))
+        for alias, slot in choose_slot("", slots, cfg).aliases.items():
+            labels = [label for label, actor in actors.items() if f"{actor}号位" == slot]
+            if len(labels) == 1:
+                issue.aliases[alias] = labels[0]
+        choice = pick(issue)
+    source, index = options[choice]
+    if source == dest:
+        raise PlanError(f"这个技能已经在第{dest}面。")
+    source_key = editable_wave(cfg, source) + "skill"
+    if len(cfg[dest_key]) >= 32:
+        raise PlanError("目标面的技能列表已满。")
+    cfg[dest_key].append(cfg[source_key].pop(index))
+    return [(dest, len(cfg[dest_key]) - 1)]
+
+
 class Session:
     def __init__(self, library, planner=None):
         self.library = library
@@ -93,11 +157,16 @@ class Session:
         self.pending = None
         self.previous = None
         self.history = []
+        self.recent_skills = []
+        self.changed_waves = ()
 
-    def execute(self, ops, answers=()):
+    def execute(self, ops, answers=(), *, player_text=None):
         if not isinstance(ops, list) or not 1 <= len(ops) <= 12:
             raise PlanError("每条消息需要包含 1 至 12 项配队操作。")
         cfg, title = copy.deepcopy(self.cfg), self.title
+        baseline = self.cfg
+        recent = list(self.recent_skills)
+        edited_skills = False
         replies = iter(answers)
 
         def pick(issue):
@@ -115,6 +184,11 @@ class Session:
                 return function(pick(issue))
 
         def slot(ref):
+            if player_text is not None and isinstance(ref, str):
+                try:
+                    return self.library.grounded_position(cfg, ref, player_text)
+                except Choose as issue:
+                    return self.library.position(cfg, pick(issue))
             return resolve(lambda value: self.library.position(cfg, value), ref)
 
         try:
@@ -124,8 +198,13 @@ class Session:
                 kind = op.get("op")
                 if kind == "load":
                     check_shape(op, ("op", "name"))
-                    title = resolve(self.library.preset_name, op["name"])
+                    selected = resolve(self.library.preset_name, op["name"])
+                    if (player_text is not None and len(ops) > 1 and selected == title
+                            and not re.search(r"重新加载|重载|重置|从原预设|恢复预设", player_text)):
+                        continue
+                    title = selected
                     cfg = self.library.load(title)
+                    baseline, recent = copy.deepcopy(cfg), []
                 elif kind == "new":
                     check_shape(op, ("op", "members"), ("assist",))
                     if not isinstance(op["members"], list) or len(op["members"]) != 3:
@@ -139,6 +218,12 @@ class Session:
                         raise PlanError("助战位置应是 1、2 或 3。")
                     cfg = self.library.new_team(names, assist)
                     title = "新建队伍"
+                    baseline, recent = copy.deepcopy(cfg), []
+                elif kind == "move_skill":
+                    if not cfg:
+                        raise PlanError("请先加载队伍并指定要移动的技能。")
+                    recent = move_recent_skill(self.library, cfg, recent, op, pick)
+                    edited_skills = True
                 elif kind == "wave":
                     check_shape(op, ("op", "wave"), ("mode", "skills", "np"))
                     if not cfg:
@@ -163,9 +248,18 @@ class Session:
                             try:
                                 action = self.library.skill(cfg, actor, item["skill"], target)
                             except Choose as issue:
-                                action = self.library.skill(cfg, actor, item["skill"], slot(pick(issue)))
+                                target = self.library.position(cfg, pick(issue))
+                                action = self.library.skill(cfg, actor, item["skill"], target)
                             result.append(action)
                         key = prefix + ("skill" if field == "skills" else "np")
+                        if field == "skills":
+                            if not edited_skills:
+                                recent = []
+                            edited_skills = True
+                            start = len(cfg[key]) if op.get("mode") == "append" else 0
+                            if op.get("mode") != "append":
+                                recent = [r for r in recent if r[0] != op["wave"]]
+                            recent.extend((op["wave"], i) for i in range(start, start + len(result)))
                         if op.get("mode") == "append":
                             result = cfg[key] + result
                         if field == "np" and (len(result) > 3 or len(set(result)) != len(result)):
@@ -174,12 +268,14 @@ class Session:
                 else:
                     raise PlanError("不支持该配队操作。")
         except Choose as issue:
-            self.pending = (ops, tuple(answers), issue)
+            self.pending = (ops, tuple(answers), issue, player_text)
             return f"{issue}　" + " / ".join(issue.choices)
         self.pending = None
-        self.previous = (self.cfg, self.title)
+        self.previous = (self.cfg, self.title, self.recent_skills)
+        self.changed_waves = changed_waves(baseline, cfg)
+        self.recent_skills = recent
         self.cfg, self.title = cfg, title
-        return f"已更新草案「{title}」。\n" + preview(cfg)
+        return f"已更新草案「{title}」。\n" + preview(cfg, self.changed_waves)
 
     def send(self, message):
         text = message.strip()
@@ -199,34 +295,41 @@ class Session:
                 return "已结束追问，保留原草案。"
             if self.previous is None:
                 return "没有可撤销的修改。"
-            self.cfg, self.title = self.previous
+            old = self.cfg
+            self.cfg, self.title, self.recent_skills = self.previous
+            self.changed_waves = changed_waves(old, self.cfg)
             self.previous = None
             self.history.clear()
-            return "已撤销上一条修改。\n" + preview(self.cfg)
+            return "已撤销上一条修改。\n" + preview(self.cfg, self.changed_waves)
         if text in ("预览", "查看队伍"):
-            return preview(self.cfg)
+            return preview(self.cfg, self.changed_waves)
         if self.pending:
-            ops, answers, issue = self.pending
-            value = norm(text).translate(NUMBERS)
+            ops, answers, issue, player_text = self.pending
+            value = norm(text).strip("。！ ").translate(NUMBERS)
+            value = norm(issue.aliases.get(value, value))
             choices = [c for c in issue.choices if norm(text) == norm(c)
                        or value in (norm(c), norm(c).removesuffix("号位"))]
             if len(choices) != 1:
                 return f"{issue}　" + " / ".join(issue.choices) + "。也可以输入「取消」。"
             self.pending = None
-            return self.remember(text, self.execute(ops, (*answers, choices[0])))
+            return self.remember(text, self.execute(ops, (*answers, choices[0]), player_text=player_text))
         match = re.fullmatch(r"(?:导出|另存为)[：:\s]+(.+)", text)
         if match:
             if not self.cfg:
                 raise PlanError("请先创建队伍草案。")
             path = export_preset(self.cfg, self.library.root / "settings", match[1])
             return f"已另存预设：{path}"
-        try:
-            reply = self.execute(offline_plan(text))
-        except (Unparsed, UnknownReference):
-            if not self.planner:
-                raise
+        move = move_request(text)
+        if move:
+            # The player identified one previous action. Preserve every unrelated action.
+            reply = self.execute([move])
+        elif text.startswith("加载预设："):
+            reply = self.execute([{"op": "load", "name": text.removeprefix("加载预设：")}])
+        elif self.planner:
             plan = self.planner(text, self)
-            reply = plan if isinstance(plan, str) else self.execute(plan)
+            reply = plan if isinstance(plan, str) else self.execute(plan, player_text=text)
+        else:
+            reply = self.execute(offline_plan(text))
         return self.remember(text, reply)
 
     def remember(self, text, reply):

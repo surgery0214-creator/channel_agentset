@@ -26,6 +26,25 @@ class Choose(PlanError):
     def __init__(self, question, choices):
         super().__init__(question)
         self.choices = choices
+        self.aliases = {}
+
+
+FRIEND_WORDS = ("好友", "好友那只", "好友那位", "借的", "借的那只", "助战", "助战那只", "助战位")
+OWN_WORDS = ("自己的", "自己的那只", "自家的", "自家那只", "我自己的", "我的那只")
+
+
+def choose_slot(question, slots, cfg):
+    choices = [f"{i}号位" for i in slots]
+    issue = Choose(question, choices)
+    assist = cfg.get("assistIdx")
+    if type(assist) is int and 0 <= assist < 6:
+        support = f"{assist+1}号位"
+        if support in choices:
+            issue.aliases.update(dict.fromkeys(FRIEND_WORDS, support))
+        own = [c for c in choices if c != support]
+        if len(own) == 1:
+            issue.aliases.update(dict.fromkeys(OWN_WORDS, own[0]))
+    return issue
 
 
 def read_json(path):
@@ -174,6 +193,11 @@ class Library:
 
     def position(self, cfg, ref):
         ref = str(ref).strip()
+        if ref in FRIEND_WORDS:
+            assist = cfg.get("assistIdx")
+            if type(assist) is not int or not 0 <= assist < 3:
+                raise PlanError("这支队伍的助战不在前排。")
+            ref = f"{assist+1}号位"
         match = POSITION.fullmatch(ref.translate(NUMBERS))
         if ref in ("1", "2", "3"):
             match = POSITION.fullmatch(ref + "号位")
@@ -185,13 +209,31 @@ class Library:
             if hint and party[slot-1] not in self.aliases.get(norm(hint), set()):
                 raise PlanError(f"{slot}号位是{party[slot-1]}，与「{hint}」不符。")
             return slot
-        matches = [i for i, name in enumerate(party[:3], 1)
-                   if name in self.aliases.get(norm(ref), set())]
+        names = self.aliases.get(norm(ref), set())
+        if ref == "狐狸":
+            # Colloquial in-party reference. Keep the catalog's exact lookup for new teams.
+            names = names | self.aliases.get("光狐", set()) | self.aliases.get("暗狐", set())
+        matches = [i for i, name in enumerate(party[:3], 1) if name in names]
         if len(matches) == 1:
             return matches[0]
         if matches:
-            raise Choose(f"「{ref}」指哪一位？", [f"{i}号位" for i in matches])
+            raise choose_slot(f"「{ref}」指哪一位？", matches, cfg)
         raise UnknownReference(f"前排没有「{ref}」，请检查当前队伍。")
+
+    def grounded_position(self, cfg, ref, player_text):
+        slot = self.position(cfg, ref)
+        name = roster(cfg)[slot - 1]
+        slots = [i for i, member in enumerate(roster(cfg)[:3], 1) if member == name]
+        if len(slots) == 1:
+            return slot
+        words = norm(player_text).translate(NUMBERS)
+        if re.search(fr"{slot}(?:号位|号|位)", words):
+            return slot
+        issue = choose_slot(f"「{name}」指哪一位？", slots, cfg)
+        for phrase, choice in issue.aliases.items():
+            if phrase in words and choice == f"{slot}号位":
+                return slot
+        raise issue
 
     def skill(self, cfg, slot, number, target):
         entry = self.data[roster(cfg)[slot-1]]
@@ -207,7 +249,8 @@ class Library:
         if entry.get("skill_type_super", entry["skill_type"])[index] != kind:
             raise PlanError("这个技能的强化状态会改变选人方式，请在原程序中配置。")
         if kind == 1 and target is None:
-            raise Choose(f"{slot}号位的{number}技能给谁？", [f"{i}号位" for i,n in enumerate(roster(cfg)[:3],1) if n])
+            slots = [i for i, name in enumerate(roster(cfg)[:3], 1) if name]
+            raise choose_slot(f"{slot}号位的{number}技能给谁？", slots, cfg)
         if kind != 1 and target is not None:
             raise PlanError(f"{slot}号位的{number}技能在角色表里无需指定队友。")
         code = (slot - 1) * 3 + index + 1
@@ -227,7 +270,7 @@ def editable_wave(cfg, wave):
     return prefix
 
 
-def preview(cfg):
+def preview(cfg, changed_waves=()):
     if not cfg:
         return "尚未选择队伍。"
     members = roster(cfg)
@@ -249,7 +292,8 @@ def preview(cfg):
             actions.extend(f"{n}号位宝具" for n in cfg.get(prefix+"np", []))
             if cfg.get(prefix+"strategy") or cfg.get(prefix+"condition"):
                 actions.append("原出卡策略／条件")
-            lines.append(f"第{wave}面 · 回合{turn+1}　" + (" → ".join(actions) or "常规出卡"))
+            marker = "〔本次修改〕" if wave in changed_waves else ""
+            lines.append(f"第{wave}面 · 回合{turn+1}{marker}　" + (" → ".join(actions) or "常规出卡"))
     return "\n".join(lines)
 
 
