@@ -15,7 +15,7 @@ def desktop(session):
     from tkinter.scrolledtext import ScrolledText
 
     root = tk.Tk()
-    root.title("BBchannel · 对话配队 v0.4")
+    root.title("BBchannel · 对话配队 v0.5")
     root.geometry("990x620")
     root.minsize(760, 460)
     root.columnconfigure(0, weight=1)

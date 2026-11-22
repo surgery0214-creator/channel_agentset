@@ -4,7 +4,7 @@ import copy
 import re
 
 from .collection import PresetFinder, collection_request
-from .battle_edit import TurnEditor, actions_for, describe
+from .battle_edit import TurnEditor, actions_for, check_swap_suffix, describe, equip, formation, integer, project
 from .edit_language import precise_plan
 from .core import Choose, NUMBERS, PlanError, choose_slot, editable_wave, export_preset, norm, preview, roster
 
@@ -19,6 +19,8 @@ HELP = """可以直接这样说
 • 第三面只改宝具：一号位放宝具
 • 第二面把二号位光狐一技能移到最前
 • 第一面第二回合删除第2项动作
+• 御主礼装换成迦勒底战斗服
+• 第二面追加：三号位光狐给公主充能，把三号位光狐换成四号位奥伯龙，然后奥伯龙开一技能
 • 新建队伍：摩根、光狐、光狐，助战三号位
 • 第一面：摩根一技能，二号位光狐一技能给摩根，摩根开宝具
 输入「预设」「预览」「撤销」「取消」或「导出 新预设名」。"""
@@ -63,11 +65,11 @@ def offline_plan(message):
     header = chunks.pop(0).strip(" ，,。；;：:")
     ops = []
     if header:
-        match = re.fullmatch(r"(?:新建队伍|新建|建队)[：:]?(.+?)(?:[，,]助战(?:在|是)?(?:第)?([123一二三])号?位?)?", header)
+        match = re.fullmatch(r"(?:新建队伍|新建|建队)[：:]?(.+?)(?:[，,]助战(?:在|是)?(?:第)?([1-6一二三四五六])号?位?)?", header)
         if match:
             members = re.split(r"[、,，+/＋]", match[1])
-            if len(members) != 3:
-                raise Unparsed("请用顿号分开三个前排名，例如「新建队伍：摩根、光狐、光狐，助战三号位」。")
+            if not 3 <= len(members) <= 6:
+                raise Unparsed("请依站位用顿号分开三至六位从者。")
             ops.append(dict(op="new", members=members, assist=int(match[2].translate(NUMBERS)) if match[2] else None))
         else:
             match = re.fullmatch(r"(?:沿用|加载|选择|使用|用)(?:现有的?)?(?:预设)?[：:]?(.+?)(?:那套|这套)?", header)
@@ -180,10 +182,10 @@ class Session:
     def execute(self, ops, answers=(), *, player_text=None):
         if not isinstance(ops, list) or not 1 <= len(ops) <= 12:
             raise PlanError("每条消息需要包含 1 至 12 项配队操作。")
-        if any(isinstance(op, dict) and op.get("op") == "edit_turn" for op in ops):
+        if any(isinstance(op, dict) and op.get("op") in ("edit_turn", "equip", "bench") for op in ops):
             from .edit_graph import EditRun
             if any(not isinstance(op, dict) or op.get("op") not in
-                   ("load", "new", "use_match", "edit_turn") for op in ops):
+                   ("load", "new", "use_match", "edit_turn", "equip", "bench") for op in ops):
                 raise PlanError("请将精确编辑和整面替换分开发送。")
             if any(op["op"] in ("load", "use_match", "new") for op in ops[1:]):
                 raise PlanError("请将选队操作放在本条编辑指令的开头。")
@@ -198,6 +200,7 @@ class Session:
         baseline = self.cfg
         recent = list(self.recent_skills)
         notes = []
+        swap_turns = []
         edited_skills = False
         replies = iter(answers)
 
@@ -254,25 +257,41 @@ class Session:
                     baseline, recent = copy.deepcopy(cfg), []
                 elif kind == "new":
                     check_shape(op, ("op", "members"), ("assist",))
-                    if not isinstance(op["members"], list) or len(op["members"]) != 3:
-                        raise PlanError("新队需要三位前排。")
+                    if not isinstance(op["members"], list) or not 3 <= len(op["members"]) <= 6:
+                        raise PlanError("新队需要三至六位从者。")
                     names = [resolve(self.library.resolve, n) for n in op["members"]]
                     assist = op.get("assist")
                     if assist is None:
-                        reply = pick(Choose("哪一位是助战？", ["1号位", "2号位", "3号位"]))
+                        reply = pick(Choose("哪一位是助战？", [f"{i}号位" for i in range(1, len(names)+1)]))
                         assist = int(reply[0])
-                    if type(assist) is not int or assist not in (1, 2, 3):
-                        raise PlanError("助战位置应是 1、2 或 3。")
+                    if type(assist) is not int or not 1 <= assist <= len(names):
+                        raise PlanError("助战位置应对应一位已配置的从者。")
                     cfg = self.library.new_team(names, assist)
                     title = "新建队伍"
                     baseline, recent = copy.deepcopy(cfg), []
-                elif kind == "edit_turn":
+                elif kind == "bench":
                     if not cfg:
                         raise PlanError("请先加载预设或新建队伍。")
-                    wave, turn = op.get("wave"), op.get("turn", 1)
-                    editor = TurnEditor(self.library, cfg, wave, turn, pick, player_text)
-                    notes.append(f"第{wave}面第{turn}回合　" + editor.edit(op))
-                    recent = []
+                    check_shape(op, ("op", "slot", "name"))
+                    index = integer(op["slot"], 4, 6, "后排站位") - 1
+                    name = resolve(self.library.resolve, op["name"])
+                    if roster(cfg)[index] not in (None, name):
+                        raise PlanError(f"{index+1}号位已有从者。请指定一个空后排，或重新建队。")
+                    cfg[f"servant_{index}_name"] = name
+                    notes.append(f"{index+1}号位后排为{name}")
+                elif kind in ("equip", "edit_turn"):
+                    if not cfg:
+                        raise PlanError("请先加载预设或新建队伍。")
+                    if kind == "equip":
+                        check_shape(op, ("op", "name"))
+                        notes.append(equip(self.library, cfg, op["name"], pick))
+                    else:
+                        wave, turn = op.get("wave"), op.get("turn", 1)
+                        editor = TurnEditor(self.library, cfg, wave, turn, pick, player_text)
+                        notes.append(f"第{wave}面第{turn}回合　" + editor.edit(op))
+                        if editor.inserted_swap:
+                            swap_turns.append((wave, turn))
+                        recent = []
                 elif kind == "move_skill":
                     if not cfg:
                         raise PlanError("请先加载队伍并指定要移动的技能。")
@@ -321,6 +340,8 @@ class Session:
                         cfg[key] = result
                 else:
                     raise PlanError("不支持该配队操作。")
+            if swap_turns:
+                check_swap_suffix(self.library, cfg, *min(swap_turns))
         except Choose as issue:
             if advanced:
                 raise
@@ -389,9 +410,13 @@ class Session:
             w, t = int(detail[1]), int(detail[2])
             items = actions_for(self.cfg, w, t)
             lines = [f"第{w}面第{t}回合"]
-            party = None if any(roster(self.cfg)[3:]) else roster(self.cfg)
             for i, item in enumerate(items):
-                lines.append(f"第{i+1}项 {describe(item, party)}")
+                try:
+                    party = roster(project(self.cfg, formation(self.cfg, w, t, i)))
+                    label = describe(item, party)
+                except PlanError:
+                    label = f"原动作{item}（站位待核对）"
+                lines.append(f"第{i+1}项 {label}")
             return "\n".join(lines)
         if self.edit_run:
             issue = self.edit_run.issue
@@ -418,7 +443,7 @@ class Session:
         query = collection_request(text, self.library)
         if query is not None:
             return self.execute([query])
-        precise = precise_plan(text)
+        precise = precise_plan(text, backline=bool(self.cfg and any(roster(self.cfg)[3:])))
         move = move_request(text)
         if precise:
             reply = self.execute(precise)

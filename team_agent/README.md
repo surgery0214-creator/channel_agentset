@@ -1,6 +1,6 @@
-# BBchannel 对话配队助手 v0.4
+# BBchannel 对话配队助手 v0.5
 
-在 Windows 上双击项目根目录的 **启动配队助手.cmd**。精确编辑需要 Python 3.10+、Tkinter 和 LangGraph。在项目根目录用启动脚本所用的 Python 安装依赖。
+在 Windows 上双击项目根目录的 **启动配队助手.cmd**。精确编辑和换人编排需要 Python 3.10+、Tkinter 和 LangGraph。在项目根目录用启动脚本所用的 Python 安装依赖。
 
 ~~~powershell
 python -m pip install -r team_agent/requirements.txt
@@ -21,7 +21,23 @@ python -m pip install -r team_agent/requirements.txt
 
 「最前」「最后」指当前连续动作段的两端。条件标记、换人和特殊动作都是段的边界。「改给」「删除」只编辑选中的一项。角色重名或技能出现多次时，助手会列出候选，可回复「好友那只」「第二次」或完整选项。「取消」丢弃待处理的整条指令，「撤销」恢复上一次修改前的草案。
 
-精确编辑适用于固定前排。含后排或退场补位的预设可以加载、预览并另存。
+## 御主礼装与换人（v0.5）
+
+下面用一支新队演示完整流程。新建时按站位依次填写三至六位从者。也可以直接载入带后排的预设，或对已有队伍说「四号位放奥伯龙」填入空后排。
+
+~~~text
+新建队伍：公主、光狐、光狐、奥伯龙，助战三号位
+御主礼装换成迦勒底战斗服
+第二面让三号位光狐先给一号位公主充能，再用换人服把三号位光狐换成四号位奥伯龙，然后奥伯龙开一技能
+第二面公主放宝具
+第三面追加：奥伯龙二技能给公主
+第三面公主放宝具
+查看第二面第一回合
+~~~
+
+这段指令会将第二面的技能编码成 [[7,1],[12,4,3],7]。换人后奥伯龙位于三号位，下一面的二技能给公主编码成 [8,1]。助手把原始队伍和助战信息写入预设，并按技能执行顺序推演礼装换人。打开预览可核对技能和宝具实际对应的站位。可以用「第一面插入御主一技能」编排御主动作，有目标的技能可写作「第一面插入御主二技能给公主」。
+
+推演依据预设记录的动作。遇到条件换人、可能换人的额外回合或退场补位记录，后续依赖站位的编辑会提示在原程序核对。实战中的阵亡、技能冷却与宝具能量请在游戏中验证。
 
 ## 按自己的从者找队伍
 
@@ -93,6 +109,6 @@ python -B -m unittest -v team_agent.test_agent
 python -B -m unittest -v team_agent.test_battle_edit
 ~~~
 
-项目入口是 __main__.py。dialogue.py 管理会话与草案，core.py 处理角色库和 BBchannel 配置。edit_language.py 解析离线编辑句式，battle_edit.py 处理回合内的技能选择和条件边界。edit_graph.py 使用 LangGraph 的 StateGraph、内存检查点、interrupt 和 Command 恢复追问。图在临时副本上校验整条指令，成功后一次性提交到会话。model.py 对接智谱和 Ollama。[LangGraph 追问与恢复](https://docs.langchain.com/oss/python/langgraph/interrupts) · [Ollama 聊天接口](https://docs.ollama.com/api/chat)
+项目入口是 __main__.py。dialogue.py 管理会话与草案，core.py 处理角色库和 BBchannel 配置。edit_language.py 解析离线编辑句式，battle_edit.py 处理站位、技能与礼装。edit_graph.py 使用 LangGraph 的 StateGraph、内存检查点、interrupt 和 Command 恢复追问。图在临时副本上校验整条指令，成功后一次性提交到会话。model.py 对接智谱和 Ollama。[LangGraph 追问与恢复](https://docs.langchain.com/oss/python/langgraph/interrupts) · [Ollama 聊天接口](https://docs.ollama.com/api/chat)
 
 单元测试在临时目录生成虚构的角色表、单回合预设和多回合预设。仅复制 team_agent 下的 Python 文件，也能运行上面的 unittest 命令。实际配队使用 BBchannel 安装目录中的角色资料和玩家预设。

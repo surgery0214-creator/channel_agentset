@@ -174,16 +174,16 @@ class Library:
         return config
 
     def new_team(self, members, assist):
-        if len(members) != 3 or not 1 <= assist <= 3:
-            raise PlanError("新队需要三位前排，并指定其中一位助战。")
+        if not 3 <= len(members) <= 6 or not 1 <= assist <= len(members):
+            raise PlanError("新队需要三至六位从者，并指定一位助战。")
         cfg = self.current()
         for key in list(cfg):
             if key.startswith("round"):
                 del cfg[key]
-        for i, name in enumerate([*members, None, None, None]):
+        for i, name in enumerate(members + [None] * (6-len(members))):
             cfg[f"servant_{i}_name"] = name
         own = {}
-        for i, name in enumerate(members):
+        for i, name in enumerate(members[:3]):
             if i != assist - 1:
                 own.setdefault(name, i)
         cfg.update(assistIdx=assist - 1, assistMode="仅从者", usedServant=list(own.values()),
@@ -275,18 +275,37 @@ def editable_wave(cfg, wave):
 
 
 def preview(cfg, changed_waves=(), changed_turns=None):
-    from .battle_edit import describe
+    from .battle_edit import describe, formation, project
 
     if not cfg:
         return "尚未选择队伍。"
     members = roster(cfg)
     lines = [f"{i}号位  {n}" + ("（助战）" if i-1 == cfg.get("assistIdx") else "")
              for i,n in enumerate(members,1) if n]
+    if "master_equip" in cfg:
+        lines.append(f"御主礼装 #{cfg['master_equip']}")
     for wave in range(1, 4):
         for turn in range(cfg.get(f"round{wave}_turns", 0)):
             prefix = f"round{wave}_turn{turn}_"
-            actions = [describe(action) for action in cfg.get(prefix+"skill", [])]
-            actions.extend(f"{n}号位宝具" for n in cfg.get(prefix+"np", []))
+            actions = []
+            skills = cfg.get(prefix+"skill", [])
+            party = None
+            uncertain = False
+            for index in range(len(skills)+1):
+                if any(members[3:]) and not uncertain:
+                    try:
+                        party = roster(project(cfg, formation(cfg, wave, turn+1, index)))
+                    except PlanError:
+                        uncertain, party = True, None
+                if index < len(skills):
+                    try:
+                        actions.append(describe(skills[index], party))
+                    except PlanError:
+                        actions.append(f"原动作{skills[index]}")
+            actions.extend(f"{n}号位" + (str(party[n-1] or "") if party and type(n) is int and 1 <= n <= 3 else "")
+                           + "宝具" for n in cfg.get(prefix+"np", []))
+            if uncertain:
+                actions.append("站位取决于分支或补位，请核对原预设")
             if cfg.get(prefix+"strategy") or cfg.get(prefix+"condition"):
                 actions.append("原出卡策略／条件")
             changed = wave in changed_waves if changed_turns is None else (wave, turn+1) in changed_turns
