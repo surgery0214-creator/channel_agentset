@@ -14,6 +14,9 @@ INSTRUCTIONS = """你是 BBchannel 国服配队助手。把玩家的要求转换
 {"ops":[{"op":"new","members":["一号位名称","二号位名称","三号位名称"],"assist":3}]}
 {"ops":[{"op":"wave","wave":2,"mode":"replace","skills":[{"who":"3号位","skill":1,"to":"1号位"}]}]}
 {"ops":[{"op":"move_skill","skill":"充能","to_wave":3}]}
+解释回合条件、两个分支和出卡顺序时只输出 {"ops":[{"op":"explain_turn","wave":1,"turn":2}]}，可用 name 指定预设。
+修改已有条件的某张候选牌用 {"op":"edit_card","section":"condition","wave":1,"turn":2,"row":1,"card":1,"who":"摩根","color":"A"}。
+调整出卡方案中已有候选牌的优先级用同样格式，section 写 strategy。B/A/Q 对应红/蓝/绿。row 表示方案编号，未指定可省略以追问；card 是玩家指定的第几张。保留角色昵称或明确的站位，交给本地校验。
 编辑已有的某一项、含后排或多回合的技能顺序时用 edit_turn。wave、turn、index、at 都从 1 开始，turn 默认 1。
 {"ops":[{"op":"edit_turn","wave":2,"turn":1,"edit":"first","who":"二号位光狐","skill":1}]}
 edit 可以是 first（本段最前）、last（本段最后）、move（at 指最终项号）、delete、retarget（to 指新目标）。
@@ -90,7 +93,7 @@ def decode_plan(content):
     if content.startswith("```") and content.endswith("```"):
         content = content.split("\n", 1)[-1][:-3].strip()
     result = json.loads(content)
-    if isinstance(result, dict) and result.get("op") in ("load", "new", "wave", "move_skill", "collection", "recommend", "use_match", "edit_turn", "equip", "bench"):
+    if isinstance(result, dict) and result.get("op") in ("load", "new", "wave", "move_skill", "collection", "recommend", "use_match", "edit_turn", "edit_card", "explain_turn", "equip", "bench"):
         return [result]  # Session validates every field, including single-operation responses.
     if isinstance(result, dict) and set(result) == {"ops"} and isinstance(result["ops"], list):
         return result["ops"]

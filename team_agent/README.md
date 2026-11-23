@@ -1,4 +1,4 @@
-# BBchannel 对话配队助手 v0.5
+# BBchannel 对话配队助手 v0.6
 
 在 Windows 上双击项目根目录的 **启动配队助手.cmd**。精确编辑和换人编排需要 Python 3.10+、Tkinter 和 LangGraph。在项目根目录用启动脚本所用的 Python 安装依赖。
 
@@ -7,6 +7,24 @@ python -m pip install -r team_agent/requirements.txt
 ~~~
 
 基础配队、预设匹配和导出仍支持 Python 3.9+ 的标准库环境。智谱、本地 Ollama 和离线句式共用同一套本地校验与导出逻辑。
+
+## 解释技能条件与修改出卡优先级（v0.6）
+
+输入「解释摩根队第一面第二回合的条件」。助手会读取这套预设，列出条件匹配和未匹配时分别执行的技能，再列出本回合的出卡方案。如果正在修改摩根队，解释会使用当前草案。查看另一套预设时也可以继续保留手中的草案和撤销记录。
+
+下面几句话可以逐条发送。
+
+~~~text
+加载预设：摩根_光狐_光狐
+解释第一面第二回合
+第一面第二回合条件1的第1张只看一号位蓝卡
+第二面第一回合出卡方案1的第2张优先一号位蓝卡
+撤销
+~~~
+
+「只看」会把指定条件中这一张牌的候选改为单张。「优先」会把出卡方案中已有的候选移到首位，其余候选按原顺序排列。一个方案中的三张牌要能一起匹配。技能条件和实战出卡使用独立设置，所以把摩根的触发条件从红卡改为蓝卡后，原出卡方案依然可以优先红卡。右侧草案会展示修改后的两条分支与出卡方案，再由你决定是否导出。
+
+指令可写从者昵称或明确站位。回合有多个方案而你省略方案号时，助手会追问。当前支持修改已有普通指令卡候选列表；宝具牌位、任意牌位以及陌生的原生条件格式可在原程序中核对。
 
 ## 精确修改已有回合（v0.4）
 
@@ -107,6 +125,7 @@ python -B -m team_agent --cli --provider bigmodel
 python -B -m team_agent --cli --provider offline
 python -B -m unittest -v team_agent.test_agent
 python -B -m unittest -v team_agent.test_battle_edit
+python -B -m unittest -v team_agent.test_card_rules
 ~~~
 
 项目入口是 __main__.py。dialogue.py 管理会话与草案，core.py 处理角色库和 BBchannel 配置。edit_language.py 解析离线编辑句式，battle_edit.py 处理站位、技能与礼装。edit_graph.py 使用 LangGraph 的 StateGraph、内存检查点、interrupt 和 Command 恢复追问。图在临时副本上校验整条指令，成功后一次性提交到会话。model.py 对接智谱和 Ollama。[LangGraph 追问与恢复](https://docs.langchain.com/oss/python/langgraph/interrupts) · [Ollama 聊天接口](https://docs.ollama.com/api/chat)

@@ -6,6 +6,7 @@ import re
 from .collection import PresetFinder, collection_request
 from .battle_edit import TurnEditor, actions_for, check_swap_suffix, describe, equip, formation, integer, project
 from .edit_language import precise_plan
+from .card_rules import card_request, edit_card, explain_turn
 from .core import Choose, NUMBERS, PlanError, choose_slot, editable_wave, export_preset, norm, preview, roster
 
 
@@ -17,6 +18,9 @@ HELP = """可以直接这样说
 • 第二面追加二号位光狐三技能给公主
 • 把刚才的充能挪到第三面
 • 第三面只改宝具：一号位放宝具
+• 解释摩根队第一面第二回合的条件
+• 第一面第二回合条件1的第1张只看一号位蓝卡
+• 第二面第一回合出卡方案1的第2张优先一号位蓝卡
 • 第二面把二号位光狐一技能移到最前
 • 第一面第二回合删除第2项动作
 • 御主礼装换成迦勒底战斗服
@@ -105,11 +109,11 @@ def check_shape(obj, required, optional=()):
         raise PlanError("动作格式不完整，请重新描述。")
 
 
-def edited_turns(before, after):
+def edited_turns(before, after, fields=("skill", "np", "condition", "strategy")):
     if not before or not after or roster(before) != roster(after):
         return []
     return [(w, t+1) for w in range(1, 4) for t in range(after.get(f"round{w}_turns", 0))
-            if any(before.get(f"round{w}_turn{t}_{f}") != after.get(f"round{w}_turn{t}_{f}") for f in ("skill", "np"))]
+            if any(before.get(f"round{w}_turn{t}_{f}") != after.get(f"round{w}_turn{t}_{f}") for f in fields)]
 
 
 def match_answer(issue, text):
@@ -178,14 +182,33 @@ class Session:
         self.changed_waves = ()
         self.changed_turns = []
         self.edit_run = None
+        self.card_turns = []
 
     def execute(self, ops, answers=(), *, player_text=None):
         if not isinstance(ops, list) or not 1 <= len(ops) <= 12:
             raise PlanError("每条消息需要包含 1 至 12 项配队操作。")
-        if any(isinstance(op, dict) and op.get("op") in ("edit_turn", "equip", "bench") for op in ops):
+        if len(ops) == 1 and isinstance(ops[0], dict) and ops[0].get("op") == "explain_turn":
+            op = ops[0]
+            check_shape(op, ("op", "wave"), ("turn", "name"))
+            cfg, title = self.cfg, self.title
+            if "name" in op:
+                if not isinstance(op["name"], str) or not op["name"].strip():
+                    raise PlanError("请写明预设名。")
+                try:
+                    title = self.library.preset_name(op["name"])
+                except Choose as issue:
+                    return f"{issue}　" + " / ".join(issue.choices) + "。请指定其中一个预设再解释。"
+                if title != self.title or cfg is None:
+                    cfg = self.library.load(title)
+            if not cfg:
+                raise PlanError("请先加载队伍，或在解释指令中指定预设名。")
+            return f"「{title}」" + explain_turn(cfg, op["wave"], op.get("turn", 1))
+        if any(isinstance(op, dict) and op.get("op") == "explain_turn" for op in ops):
+            raise PlanError("请单独发送解释指令。")
+        if any(isinstance(op, dict) and op.get("op") in ("edit_turn", "edit_card", "equip", "bench") for op in ops):
             from .edit_graph import EditRun
             if any(not isinstance(op, dict) or op.get("op") not in
-                   ("load", "new", "use_match", "edit_turn", "equip", "bench") for op in ops):
+                   ("load", "new", "use_match", "edit_turn", "edit_card", "equip", "bench") for op in ops):
                 raise PlanError("请将精确编辑和整面替换分开发送。")
             if any(op["op"] in ("load", "use_match", "new") for op in ops[1:]):
                 raise PlanError("请将选队操作放在本条编辑指令的开头。")
@@ -279,6 +302,10 @@ class Session:
                         raise PlanError(f"{index+1}号位已有从者。请指定一个空后排，或重新建队。")
                     cfg[f"servant_{index}_name"] = name
                     notes.append(f"{index+1}号位后排为{name}")
+                elif kind == "edit_card":
+                    if not cfg:
+                        raise PlanError("请先加载队伍。")
+                    notes.append(edit_card(self.library, cfg, op, pick, player_text))
                 elif kind in ("equip", "edit_turn"):
                     if not cfg:
                         raise PlanError("请先加载预设或新建队伍。")
@@ -347,7 +374,8 @@ class Session:
                 raise
             self.pending = (ops, tuple(answers), issue, player_text)
             return f"{issue}　" + " / ".join(issue.choices)
-        result = dict(cfg=cfg, title=title, recent=recent, turns=edited_turns(baseline, cfg), notes=notes)
+        result = dict(cfg=cfg, title=title, recent=recent, turns=edited_turns(baseline, cfg),
+                      card_turns=edited_turns(baseline, cfg, ("condition", "strategy")), notes=notes)
         return result if advanced else self._commit(result)
 
     def _finish_run(self, result):
@@ -362,19 +390,21 @@ class Session:
     def _commit(self, result):
         self.pending = None
         self.previous = (self.cfg, self.title, self.recent_skills)
-        self._mark_turns(result["turns"])
+        self._mark_turns(result["turns"], result["card_turns"])
         self.recent_skills = result["recent"]
         self.cfg, self.title = result["cfg"], result["title"]
         self.finder.names = []
         summary = "；".join(result["notes"])
         return f"已更新草案「{self.title}」。{summary}\n" + self.preview()
 
-    def _mark_turns(self, turns):
+    def _mark_turns(self, turns, card_turns):
         self.changed_turns = [tuple(turn) for turn in turns]
         self.changed_waves = tuple(sorted({wave for wave, _ in self.changed_turns}))
+        self.card_turns = [tuple(turn) for turn in card_turns]
 
     def preview(self):
-        return preview(self.cfg, self.changed_waves, self.changed_turns)
+        return "\n\n".join([preview(self.cfg, self.changed_waves, self.changed_turns),
+                             *(explain_turn(self.cfg, w, t) for w, t in self.card_turns)])
 
     def send(self, message):
         text = message.strip()
@@ -398,13 +428,17 @@ class Session:
                 return "没有可撤销的修改。"
             old = self.cfg
             self.cfg, self.title, self.recent_skills = self.previous
-            self._mark_turns(edited_turns(old, self.cfg))
+            self._mark_turns(edited_turns(old, self.cfg), edited_turns(old, self.cfg, ("condition", "strategy")))
             self.previous = None
             self.finder.names = []
             self.history.clear()
             return "已撤销上一条修改。\n" + self.preview()
         if text in ("预览", "查看队伍"):
             return self.preview()
+        if text.startswith(("解释", "说明")):
+            query = card_request(text)
+            if query and query["op"] == "explain_turn":
+                return self.execute([query])
         detail = re.fullmatch(r"(?:查看|预览)第?([123])面第?(\d+)回合", text.translate(NUMBERS))
         if detail and self.cfg:
             w, t = int(detail[1]), int(detail[2])
@@ -440,7 +474,7 @@ class Session:
                 raise PlanError("请先创建队伍草案。")
             path = export_preset(self.cfg, self.library.root / "settings", match[1])
             return f"已另存预设：{path}"
-        query = collection_request(text, self.library)
+        query = card_request(text) or collection_request(text, self.library)
         if query is not None:
             return self.execute([query])
         precise = precise_plan(text, backline=bool(self.cfg and any(roster(self.cfg)[3:])))
@@ -454,6 +488,10 @@ class Session:
             reply = self.execute([{"op": "load", "name": text.removeprefix("加载预设：")}])
         elif self.planner:
             plan = self.planner(text, self)
+            if (text.startswith(("解释", "说明")) and not isinstance(plan, str)
+                    and not (isinstance(plan, list) and len(plan) == 1 and isinstance(plan[0], dict)
+                             and plan[0].get("op") == "explain_turn")):
+                raise PlanError("请指定要解释的面和回合，例如「解释第一面第二回合」。")
             reply = plan if isinstance(plan, str) else self.execute(plan, player_text=text)
         else:
             reply = self.execute(offline_plan(text))
